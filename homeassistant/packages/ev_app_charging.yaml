@@ -1,0 +1,423 @@
+# EV charging through the VW app on an Android phone, controlled by Home Assistant via ADB.
+# Example package: copy to /config/packages/ (packages must be enabled, see README) and adapt.
+#
+# Requirements
+#   - vw.sh on the phone at /data/local/tmp/vw.sh (see ../../phone/)
+#   - integration "Android Debug Bridge" (androidtv) for the phone, ADB server/port 5555
+#     -> rename its media_player entity to media_player.ev_phone_adb (or change it below)
+#
+# PLACEHOLDERS - replace with your own entities:
+#   sensor.grid_power          grid power in W, positive = import, negative = export (your meter)
+#   sensor.vehicle_api_soc     optional: battery level from another source (car API, OBD, ...);
+#                              leave it as is if you have none, the level read from the app is used
+#
+# What it does (automation "EV: control charging", every 5 minutes and on changes):
+#   reason "trip"     input_select.ev_trip_charge is 80 % or 100 %: charge now until that level, max current.
+#                     Targets above 80 % are written to the app before every start, because the app
+#                     resets the target to 80 % after every stop (battery care mode).
+#   reason "minimum"  battery below input_number.ev_minimum_soc: charge until 10 points above it, max current
+#   reason "solar"    PV surplus above the threshold for 10 minutes: charge until input_number.ev_solar_target,
+#                     reduced current
+#   HA only stops charging it started itself (input_boolean.ev_charging_by_ha).
+#   input_boolean.ev_manual_charging = "hands off": HA neither starts nor stops.
+#
+# Every call opens the VW app visibly on the phone for 10-60 seconds.
+
+input_boolean:
+  ev_charging_automation:
+    name: EV charging automation
+    icon: mdi:ev-station
+  ev_charging_by_ha:
+    name: EV charging started by HA
+    icon: mdi:robot
+  ev_manual_charging:
+    name: EV charging without HA
+    icon: mdi:hand-back-right
+
+input_select:
+  ev_app_status:
+    name: EV app status
+    icon: mdi:ev-plug-type2
+    options: [unknown, unplugged, plugged, charging, error]
+  ev_charge_reason:
+    name: EV charge reason
+    icon: mdi:help-circle-outline
+    options: [none, solar, minimum, trip]
+  ev_trip_charge:
+    name: EV charge for trip
+    icon: mdi:car-arrow-right
+    options: ["Off", "80 %", "100 %"]
+  ev_charge_current:
+    name: EV charge current (last set)
+    icon: mdi:current-ac
+    options: [unknown, max, reduced]
+
+input_datetime:
+  ev_app_status_time:
+    name: EV app status read at
+    has_date: true
+    has_time: true
+  ev_charging_stopped_time:
+    name: EV charging stopped at
+    has_date: true
+    has_time: true
+
+input_number:
+  ev_app_soc:
+    name: EV battery level from app
+    min: 0
+    max: 100
+    step: 1
+    unit_of_measurement: "%"
+    mode: box
+  ev_minimum_soc:
+    name: EV minimum battery level
+    icon: mdi:battery-alert
+    min: 10
+    max: 60
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+  ev_solar_target:
+    name: EV solar charge target
+    icon: mdi:battery-high
+    min: 50
+    max: 80
+    step: 5
+    unit_of_measurement: "%"
+    mode: slider
+  ev_charge_power:
+    name: EV charging power (estimate)
+    icon: mdi:flash
+    min: 0
+    max: 11000
+    step: 100
+    unit_of_measurement: W
+    mode: box
+  ev_solar_threshold:
+    name: EV solar start threshold
+    icon: mdi:solar-power-variant
+    min: 300
+    max: 4000
+    step: 100
+    unit_of_measurement: W
+    mode: box
+
+input_text:
+  ev_app_message:
+    name: EV app last message
+    max: 255
+
+template:
+  - binary_sensor:
+      - name: EV phone ADB reachable
+        unique_id: ev_phone_adb_reachable
+        device_class: connectivity
+        state: "{{ states('media_player.ev_phone_adb') not in ['unavailable', 'unknown'] }}"
+      # On above the threshold, off below half of it, each for 10 minutes (clouds)
+      - name: EV solar surplus
+        unique_id: ev_solar_surplus
+        icon: mdi:solar-power-variant
+        state: >-
+          {% set p = states('sensor.ev_solar_available') | float(0) %}
+          {% set t = states('input_number.ev_solar_threshold') | float(1400) %}
+          {{ p >= t or (this.state == 'on' and p >= t / 2) }}
+        delay_on:
+          minutes: 10
+        delay_off:
+          minutes: 10
+    sensor:
+      # Power available for the car: export, plus what the car draws if HA is charging it
+      - name: EV solar available
+        unique_id: ev_solar_available
+        unit_of_measurement: W
+        device_class: power
+        state: >-
+          {% set grid = states('sensor.grid_power') | float(0) %}
+          {% set car = states('input_number.ev_charge_power') | float(0)
+             if is_state('input_boolean.ev_charging_by_ha', 'on') and is_state('input_select.ev_app_status', 'charging') else 0 %}
+          {{ (car - grid) | round(0) }}
+      # Battery level: from the app; falls back to another source if you have one
+      - name: EV battery level
+        unique_id: ev_battery_level
+        unit_of_measurement: "%"
+        device_class: battery
+        state: >-
+          {% set app = states('input_number.ev_app_soc') | int(0) %}
+          {% set api = states('sensor.vehicle_api_soc') | float(-1) %}
+          {{ app if app > 0 or api < 0 else api | round(0) | int }}
+
+script:
+  ev_app:
+    alias: EV app command
+    description: >-
+      Runs vw.sh on the phone via ADB. androidtv.adb_command only waits about 10 s for an answer, so vw.sh
+      is started in the background ("bg") and its last output line is polled every 3 s for up to 90 s.
+      Writes ev_app_status / ev_app_status_time / ev_app_message and returns {status, message}.
+    mode: queued
+    max: 3
+    icon: mdi:cellphone-cog
+    fields:
+      command:
+        name: Command
+        description: status, start, stop, current_max, current_reduced, target 80, target 100, home
+        required: true
+        default: status
+        example: status
+        selector:
+          text: {}
+    sequence:
+      # Only pass known commands to the phone's shell
+      - if:
+          - condition: template
+            value_template: "{{ not (command is match('^(status|start|stop|current_max|current_reduced|home|target (5[0-9]|[6-9][0-9]|100))$')) }}"
+        then:
+          - stop: unknown command
+            error: true
+      - action: androidtv.adb_command
+        target:
+          entity_id: media_player.ev_phone_adb
+        data:
+          command: "sh /data/local/tmp/vw.sh bg {{ command }}"
+        continue_on_error: true
+      - repeat:
+          sequence:
+            - delay:
+                seconds: 3
+            - action: androidtv.adb_command
+              target:
+                entity_id: media_player.ev_phone_adb
+              data:
+                command: "tail -1 /data/local/tmp/vw.out 2>/dev/null"
+              continue_on_error: true
+          until:
+            - condition: template
+              value_template: >-
+                {{ 'STATUS=' in (state_attr('media_player.ev_phone_adb', 'adb_response') | string) or repeat.index >= 30 }}
+      - variables:
+          answer: "{{ state_attr('media_player.ev_phone_adb', 'adb_response') | string }}"
+          status: "{% set m = answer | regex_findall('STATUS=([a-z_]+)') %}{{ m[-1] if m else 'error' }}"
+          message: >-
+            {% set m = answer | regex_findall('MESSAGE=(.*)$') %}{{ (command ~ ': ' ~ (m[-1] if m else ('no answer from the phone' if status == 'error' else 'ok')))[:250] }}
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.ev_app_status
+        data:
+          option: "{{ status }}"
+      - action: input_datetime.set_datetime
+        target:
+          entity_id: input_datetime.ev_app_status_time
+        data:
+          timestamp: "{{ now().timestamp() }}"
+      - action: input_text.set_value
+        target:
+          entity_id: input_text.ev_app_message
+        data:
+          value: "{{ message }}"
+      - variables:
+          result:
+            status: "{{ status }}"
+            message: "{{ message }}"
+      - stop: done
+        response_variable: result
+
+automation:
+  - id: ev_app_soc_from_message
+    alias: "EV: remember battery level from the app"
+    triggers:
+      - trigger: state
+        entity_id: input_text.ev_app_message
+    conditions:
+      - condition: template
+        value_template: "{{ trigger.to_state.state is search('soc [0-9]+') }}"
+    actions:
+      - action: input_number.set_value
+        target:
+          entity_id: input_number.ev_app_soc
+        data:
+          value: "{{ (trigger.to_state.state | regex_findall('soc ([0-9]+)'))[-1] | int }}"
+      - if:
+          - condition: template
+            value_template: "{{ trigger.to_state.state is search('power [0-9.]+') }}"
+        then:
+          - action: input_number.set_value
+            target:
+              entity_id: input_number.ev_charge_power
+            data:
+              value: "{{ ((trigger.to_state.state | regex_findall('power ([0-9.]+)'))[-1] | float(0) * 1000) | round(0) }}"
+
+  - id: ev_charging_control
+    alias: "EV: control charging"
+    mode: single
+    max_exceeded: silent
+    triggers:
+      - trigger: time_pattern
+        minutes: /5
+      - trigger: state
+        id: change
+        entity_id:
+          - binary_sensor.ev_solar_surplus
+          - input_select.ev_trip_charge
+        to: ~
+      - trigger: state
+        id: change
+        entity_id: input_boolean.ev_manual_charging
+        to: "off"
+      - trigger: state
+        id: change
+        entity_id: input_boolean.ev_charging_automation
+        to: "on"
+    conditions:
+      - condition: state
+        entity_id: input_boolean.ev_charging_automation
+        state: "on"
+      - condition: state
+        entity_id: binary_sensor.ev_phone_adb_reachable
+        state: "on"
+    actions:
+      - variables:
+          now_ts: "{{ now().timestamp() }}"
+          soc: "{{ states('sensor.ev_battery_level') | float(0) }}"
+          minimum: "{{ states('input_number.ev_minimum_soc') | float(30) }}"
+          solar_target: "{{ states('input_number.ev_solar_target') | float(80) }}"
+          trip_target: "{{ {'80 %': 80, '100 %': 100}.get(states('input_select.ev_trip_charge'), 0) }}"
+          solar_ok: "{{ is_state('binary_sensor.ev_solar_surplus', 'on') }}"
+          by_ha: "{{ is_state('input_boolean.ev_charging_by_ha', 'on') }}"
+          manual: "{{ is_state('input_boolean.ev_manual_charging', 'on') }}"
+          reason: "{{ states('input_select.ev_charge_reason') }}"
+          status: "{{ states('input_select.ev_app_status') }}"
+          status_age: "{{ now_ts - state_attr('input_datetime.ev_app_status_time', 'timestamp') | float(0) }}"
+          stop_age: "{{ now_ts - state_attr('input_datetime.ev_charging_stopped_time', 'timestamp') | float(0) }}"
+          # trip > minimum > solar > none
+          wanted: >-
+            {%- if trip_target > 0 and soc < trip_target -%}trip
+            {%- elif soc < minimum or (by_ha and reason == 'minimum' and soc < minimum + 10) -%}minimum
+            {%- elif solar_ok and soc < solar_target -%}solar
+            {%- else -%}none{%- endif -%}
+          current: "{{ 'reduced' if wanted == 'solar' else 'max' }}"
+      - choose:
+          # Hands off: forget that HA started it, never start or stop
+          - conditions: "{{ manual }}"
+            sequence:
+              - action: input_boolean.turn_off
+                target:
+                  entity_id: input_boolean.ev_charging_by_ha
+              - action: input_select.select_option
+                target:
+                  entity_id: input_select.ev_charge_reason
+                data:
+                  option: none
+
+          # HA is charging, no reason left: stop
+          - conditions: "{{ by_ha and wanted == 'none' }}"
+            sequence:
+              - action: script.ev_app
+                data:
+                  command: stop
+                response_variable: r
+              - if: "{{ r.status in ['plugged', 'unplugged'] }}"
+                then:
+                  - action: input_boolean.turn_off
+                    target:
+                      entity_id: input_boolean.ev_charging_by_ha
+                  - action: input_select.select_option
+                    target:
+                      entity_id: input_select.ev_charge_reason
+                    data:
+                      option: none
+                  - action: input_datetime.set_datetime
+                    target:
+                      entity_id: input_datetime.ev_charging_stopped_time
+                    data:
+                      timestamp: "{{ now().timestamp() }}"
+
+          # HA is charging and should go on: keep the reason up to date, look into the app once an hour
+          - conditions: "{{ by_ha }}"
+            sequence:
+              - if: "{{ reason != wanted }}"
+                then:
+                  - action: input_select.select_option
+                    target:
+                      entity_id: input_select.ev_charge_reason
+                    data:
+                      option: "{{ wanted }}"
+              - if: "{{ status_age > 3600 }}"
+                then:
+                  - action: script.ev_app
+                    data:
+                      command: status
+                    response_variable: rs
+                  # Not charging any more (stopped by hand, target reached, unplugged): release, and
+                  # do not restart for solar within the next 6 hours
+                  - if: "{{ rs.status in ['plugged', 'unplugged'] }}"
+                    then:
+                      - action: input_boolean.turn_off
+                        target:
+                          entity_id: input_boolean.ev_charging_by_ha
+                      - action: input_select.select_option
+                        target:
+                          entity_id: input_select.ev_charge_reason
+                        data:
+                          option: none
+                      - action: input_datetime.set_datetime
+                        target:
+                          entity_id: input_datetime.ev_charging_stopped_time
+                        data:
+                          timestamp: "{{ now().timestamp() + 6 * 3600 }}"
+
+          # Not charging, but there is a reason: start (not too often, the app opens visibly every time)
+          - conditions:
+              - "{{ wanted != 'none' }}"
+              - "{{ status_age > (3600 if status == 'unplugged' else 900) or trigger.id == 'change' }}"
+              - "{{ stop_age > 1800 or wanted in ['trip', 'minimum'] }}"
+            sequence:
+              # The app resets the target to 80 % after every stop: set the trip target before every start
+              - if: "{{ wanted == 'trip' and trip_target > 80 }}"
+                then:
+                  - action: script.ev_app
+                    data:
+                      command: "target {{ trip_target }}"
+              - if: "{{ states('input_select.ev_charge_current') != current }}"
+                then:
+                  - action: script.ev_app
+                    data:
+                      command: "{{ 'current_max' if current == 'max' else 'current_reduced' }}"
+                    response_variable: rc
+                  - if: "{{ rc.status != 'error' }}"
+                    then:
+                      - action: input_select.select_option
+                        target:
+                          entity_id: input_select.ev_charge_current
+                        data:
+                          option: "{{ current }}"
+              - action: script.ev_app
+                data:
+                  command: start
+                response_variable: r
+              - choose:
+                  - conditions: "{{ r.status == 'charging' }}"
+                    sequence:
+                      - action: input_select.select_option
+                        target:
+                          entity_id: input_select.ev_charge_reason
+                        data:
+                          option: "{{ wanted }}"
+                      - action: input_boolean.turn_on
+                        target:
+                          entity_id: input_boolean.ev_charging_by_ha
+                  - conditions: "{{ r.status == 'unplugged' and wanted in ['trip', 'minimum'] }}"
+                    sequence:
+                      - action: persistent_notification.create
+                        data:
+                          notification_id: ev_plug_in
+                          title: "EV: please plug in"
+                          message: "HA wants to charge ({{ wanted }}, battery {{ soc | int }} %), but the cable is not connected."
+                  - conditions: "{{ r.status in ['unknown', 'error'] }}"
+                    sequence:
+                      - action: persistent_notification.create
+                        data:
+                          notification_id: ev_app_state
+                          title: "EV: app not usable"
+                          message: >-
+                            HA wanted to charge ({{ wanted }}), but the VW app reports: {{ r.message }}.
+                            Logged out, or the app was updated? Check the texts with "vw.sh texts" and vw.conf.

@@ -1,0 +1,23 @@
+[Unit]
+Description=Keep ADB over Wi-Fi (port 5555) open on the charging phone
+Wants=network-online.target
+After=network-online.target
+ConditionPathExists=/var/lib/adb-keepalive/.android/adbkey
+
+[Service]
+Type=oneshot
+# Adjust: fixed IP of the phone
+Environment=PHONE_IP=192.0.2.10
+Environment=ADB_HOME=/var/lib/adb-keepalive
+Environment=ADB_MDNS=/usr/local/sbin/adb-mdns
+ExecStart=/usr/local/sbin/adb-keepalive
+ReadWritePaths=/var/lib/adb-keepalive
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK

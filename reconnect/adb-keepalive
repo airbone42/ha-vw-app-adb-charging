@@ -1,0 +1,45 @@
+#!/bin/bash
+# adb-keepalive: keep classic ADB over Wi-Fi (TCP port 5555) open on a phone, so that Home Assistant's
+# "Android Debug Bridge" integration can reach it.
+#
+# `adb tcpip 5555` does not survive a reboot of the phone. "Wireless debugging" (Android 11+) can be
+# switched back on after a reboot (by hand, or by an automation app setting the global setting
+# adb_wifi_enabled=1), but it listens on a random TLS port. This script, run every few minutes:
+#   1. exits quietly if port 5555 is open,
+#   2. otherwise finds the wireless-debugging port via mDNS (adb-mdns),
+#   3. connects with an already paired key ($HOME/.android/adbkey) and runs `adb tcpip 5555`.
+# It prints something only when it acted or failed (ends up in the journal when run by systemd).
+#
+# Configuration via environment (see adb-keepalive.service):
+#   PHONE_IP     IP address of the phone (give it a fixed DHCP lease)
+#   ADB_HOME     directory that contains .android/adbkey (+ adbkey.pub) of a paired key
+#   ADB_MDNS     path of adb-mdns (default: next to this script)
+set -uo pipefail
+IP=${PHONE_IP:?set PHONE_IP}
+export HOME=${ADB_HOME:-/var/lib/adb-keepalive}
+MDNS=${ADB_MDNS:-$(dirname "$(readlink -f "$0")")/adb-mdns}
+
+is_open() { timeout 5 bash -c "</dev/tcp/$IP/5555" 2>/dev/null; }
+is_open && exit 0
+
+cleanup() { adb disconnect >/dev/null 2>&1; adb kill-server >/dev/null 2>&1; }
+trap cleanup EXIT
+
+port=$("$MDNS" "$IP" 12)
+if [ -z "$port" ]; then
+  echo "5555 closed and wireless debugging does not answer (phone off, not on Wi-Fi, locked, or wireless debugging off)"
+  exit 0
+fi
+adb start-server >/dev/null 2>&1
+adb connect "$IP:$port" >/dev/null 2>&1
+if ! adb -s "$IP:$port" get-state 2>/dev/null | grep -q device; then
+  echo "cannot connect to $IP:$port (key not paired?)"
+  exit 1
+fi
+adb -s "$IP:$port" tcpip 5555 >/dev/null 2>&1
+for _ in 1 2 3 4 5; do
+  sleep 2
+  is_open && { echo "5555 open again (via wireless debugging port $port)"; exit 0; }
+done
+echo "ran tcpip 5555, but port 5555 is still closed"
+exit 1
