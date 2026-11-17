@@ -3,6 +3,8 @@
 # (uiautomator dump, input tap/text/swipe, bringing an app to the front). Without it, two scripts that run at
 # the same time (e.g. vw.sh and a second automation on the same wall phone) tap into each other's app.
 # Rule: whoever drives the UI takes this lock first. A plain `am force-stop` of a background app does not need it.
+# A person using the phone has priority: ui_lock also waits while someone touched the screen within the last
+# UL_QUIET s (default 45, 0 disables), read from `dumpsys power`, so a script never interrupts normal use.
 #
 # Install:   adb push ui_lock.sh /data/local/tmp/ui_lock.sh
 #
@@ -17,6 +19,7 @@
 #   sh ui_lock.sh take <name> [wait_s=120] [max_s=180]  -> exit 0 and "UI_LOCK=<name> ..." or exit 1 and "UI_LOCK_BUSY=..."
 #   sh ui_lock.sh release <name>                       -> releases only a lock with that name
 #   sh ui_lock.sh who                                  -> "UI_LOCK=free" or "UI_LOCK=<name> since N s (pid P, max M s)"
+#   sh ui_lock.sh human                                -> "HUMAN=yes|no (last touch N s ago, ...)"
 #   sh ui_lock.sh bg <name> <wait_s> '<commands>'      -> detached: take the lock, run the commands, release
 #                                                         (for HA, androidtv.adb_command only waits ~10 s);
 #                                                         output in $UL_D/ui_lock_<name>.out
@@ -27,6 +30,8 @@
 UL_D=${UL_D:-/data/local/tmp}
 UL=$UL_D/ui.lock
 UL_W=$UL_D/ui.lock.waiting
+UL_F=$UL_D/ui.lock.released   # epoch of the last release: activity right before it came from a script, not a person
+UL_QUIET=${UL_QUIET:-45}      # seconds without touch before a script may start; 0 = ignore people
 UL_WHO=''
 UL_MINE=''
 
@@ -47,6 +52,18 @@ _ul_valid() {
   case "$_ul_p" in -|'') return 0 ;; esac
   kill -0 "$_ul_p" 2>/dev/null
 }
+# 0 if a person touched the phone within the last UL_QUIET s. mLastUserActivityTime also counts `input tap` from
+# scripts, so activity up to 3 s after the last release counts as a script. Sets UL_HUMAN (readable).
+ui_human() {
+  [ "$UL_QUIET" -gt 0 ] 2>/dev/null || return 1
+  _ul_ms=$(dumpsys power 2>/dev/null | grep -m1 'mLastUserActivityTime=' | sed -n 's/.*(\([0-9]*\) ms ago).*/\1/p')
+  _ul_fr=$(cat $UL_F 2>/dev/null); case "$_ul_fr" in ''|*[!0-9]*) _ul_fr=0 ;; esac
+  case "$_ul_ms" in ''|*[!0-9]*) UL_HUMAN="unknown (no value from dumpsys power)"; return 1 ;; esac
+  _ul_s=$(( _ul_ms / 1000 ))
+  UL_HUMAN="last touch $_ul_s s ago"; [ $_ul_fr -gt 0 ] && UL_HUMAN="$UL_HUMAN, last release $(( $(_ul_now) - _ul_fr )) s ago"
+  [ $_ul_s -lt $UL_QUIET ] || return 1
+  [ $(( $(_ul_now) - _ul_s )) -gt $(( _ul_fr + 3 )) ]
+}
 # remove a stale lock, but only if it has not changed since it was checked
 _ul_break() {
   [ "$(cat $UL/who 2>/dev/null)" = "$_ul_c" ] || return 0
@@ -60,6 +77,12 @@ ui_lock() {
   if [ -n "$UI_LOCK_TOKEN" ] && [ "$(cat $UL/who 2>/dev/null)" = "$UI_LOCK_TOKEN" ]; then UL_WHO="$UI_LOCK_TOKEN"; return 0; fi
   _ul_told=''
   while :; do
+    if [ ! -d $UL ] && ui_human; then
+      UL_WHO="person using the phone ($UL_HUMAN)"
+      [ $(( $(_ul_now) - _ul_start )) -ge $_ul_wait ] && return 1
+      [ -z "$_ul_told" ] && { echo "WAITING: $UL_WHO"; _ul_told=1; }
+      sleep 5; continue
+    fi
     if mkdir $UL 2>/dev/null; then
       UL_MINE="$_ul_name $(_ul_now) $_ul_pid $_ul_max"
       echo "$UL_MINE" > $UL/who
@@ -77,7 +100,7 @@ ui_lock() {
 }
 ui_unlock() {
   [ -n "$UL_MINE" ] || return 0
-  [ "$(cat $UL/who 2>/dev/null)" = "$UL_MINE" ] && rm -rf $UL
+  [ "$(cat $UL/who 2>/dev/null)" = "$UL_MINE" ] && { _ul_now > $UL_F; rm -rf $UL; }
   UL_MINE=''
 }
 _ul_exit() {
@@ -102,16 +125,19 @@ case "$0" in
         echo "UI_LOCK_BUSY=$UL_WHO"; exit 1 ;;
       release)
         own=$(cut -d' ' -f1 $UL/who 2>/dev/null)
-        if [ -n "$2" ] && [ "$own" = "$2" ]; then rm -rf $UL; echo "UI_LOCK=free"; else echo "UI_LOCK not ours (${own:-none})"; fi
+        if [ -n "$2" ] && [ "$own" = "$2" ]; then _ul_now > $UL_F; rm -rf $UL; echo "UI_LOCK=free"; else echo "UI_LOCK not ours (${own:-none})"; fi
         exit 0 ;;
       who)
         if [ -d $UL ] && _ul_valid; then echo "UI_LOCK=$UL_WHO"; elif [ -d $UL ]; then echo "UI_LOCK=stale ($UL_WHO)"; else echo "UI_LOCK=free"; fi
+        exit 0 ;;
+      human)
+        if ui_human; then echo "HUMAN=yes ($UL_HUMAN)"; else echo "HUMAN=no ($UL_HUMAN)"; fi
         exit 0 ;;
       bg)
         n=${2:?name}; w=${3:-120}; shift 3
         o=$UL_D/ui_lock_$n.out
         ( trap '' HUP; nohup setsid sh -c ". $UL_D/ui_lock.sh; ui_lock '$n' '$w' || { echo \"UI_LOCK_BUSY=\$UL_WHO\"; exit 1; }; $*; echo UI_LOCK_DONE" > $o 2>&1 < /dev/null & )
         echo "STARTED $n"; exit 0 ;;
-      *) echo "usage: ui_lock.sh take|release|who|bg ..."; exit 2 ;;
+      *) echo "usage: ui_lock.sh take|release|who|human|bg ..."; exit 2 ;;
     esac ;;
 esac
