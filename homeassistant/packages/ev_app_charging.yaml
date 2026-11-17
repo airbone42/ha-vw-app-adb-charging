@@ -152,8 +152,9 @@ script:
     alias: EV app command
     description: >-
       Runs vw.sh on the phone via ADB. androidtv.adb_command only waits about 10 s for an answer, so vw.sh
-      is started in the background ("bg") and its last output line is polled every 3 s for up to 90 s.
-      Writes ev_app_status / ev_app_status_time / ev_app_message and returns {status, message}.
+      is started in the background ("bg") and its last output line is polled every 3 s for up to 240 s
+      (vw.sh may wait up to 120 s for the shared UI lock, phone/ui_lock.sh). Writes ev_app_status /
+      ev_app_status_time / ev_app_message and returns {status, message}. "phone busy" only updates the message.
     mode: queued
     max: 3
     icon: mdi:cellphone-cog
@@ -193,22 +194,27 @@ script:
           until:
             - condition: template
               value_template: >-
-                {{ 'STATUS=' in (state_attr('media_player.ev_phone_adb', 'adb_response') | string) or repeat.index >= 30 }}
+                {{ 'STATUS=' in (state_attr('media_player.ev_phone_adb', 'adb_response') | string) or repeat.index >= 80 }}
       - variables:
           answer: "{{ state_attr('media_player.ev_phone_adb', 'adb_response') | string }}"
           status: "{% set m = answer | regex_findall('STATUS=([a-z_]+)') %}{{ m[-1] if m else 'error' }}"
           message: >-
             {% set m = answer | regex_findall('MESSAGE=(.*)$') %}{{ (command ~ ': ' ~ (m[-1] if m else ('no answer from the phone' if status == 'error' else 'ok')))[:250] }}
-      - action: input_select.select_option
-        target:
-          entity_id: input_select.ev_app_status
-        data:
-          option: "{{ status }}"
-      - action: input_datetime.set_datetime
-        target:
-          entity_id: input_datetime.ev_app_status_time
-        data:
-          timestamp: "{{ now().timestamp() }}"
+      # "phone busy" (another script holds the UI lock) says nothing about the car: keep the status
+      - if:
+          - condition: template
+            value_template: "{{ 'phone busy' not in message }}"
+        then:
+          - action: input_select.select_option
+            target:
+              entity_id: input_select.ev_app_status
+            data:
+              option: "{{ status }}"
+          - action: input_datetime.set_datetime
+            target:
+              entity_id: input_datetime.ev_app_status_time
+            data:
+              timestamp: "{{ now().timestamp() }}"
       - action: input_text.set_value
         target:
           entity_id: input_text.ev_app_message

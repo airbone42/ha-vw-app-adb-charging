@@ -19,6 +19,11 @@
 #   bg <command> [args]        run <command> detached, write the output to $WORKDIR/vw.out
 #                              (androidtv.adb_command only waits ~10 s for an answer)
 #
+# Shared UI lock: if $WORKDIR/ui_lock.sh exists, every command that drives the app (status, start, stop,
+# current_*, target*) first takes the lock "vw-<command>" and waits up to 120 s for it, so that other scripts
+# driving the same phone do not tap into the VW app (and vice versa). If the phone stays busy, the result is
+# STATUS=error MESSAGE=phone busy (<who>). texts and home do not take it.
+#
 # Output: the LAST line is always
 #   STATUS=<charging|plugged|unplugged|unknown|error> MESSAGE=<text>[ soc NN][ power N.N]
 #   charging   the app shows the "stop charging" button
@@ -228,6 +233,14 @@ set_current() {  # $1 on = reduced, off = maximum
 }
 
 finish() { go_home; echo "STATUS=$1 MESSAGE=${2:-ok}${SOC:+ soc $SOC}${POWER:+ power $POWER}"; exit 0; }
+
+case "$1" in
+  status|start|stop|current_max|current_reduced|target|target_trip|target_normal)
+    if [ -f "$WORKDIR/ui_lock.sh" ]; then
+      . "$WORKDIR/ui_lock.sh"
+      ui_lock "vw-$1" 120 300 || { echo "STATUS=error MESSAGE=phone busy ($UL_WHO)"; exit 0; }
+    fi ;;
+esac
 
 case "$1" in
   bg)
