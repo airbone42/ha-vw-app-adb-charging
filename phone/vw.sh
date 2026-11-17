@@ -25,7 +25,9 @@
 # STATUS=error MESSAGE=phone busy (<who>). texts and home do not take it.
 #
 # Output: the LAST line is always
-#   STATUS=<charging|plugged|unplugged|unknown|error> MESSAGE=<text>[ soc NN][ power N.N]
+#   STATUS=<charging|plugged|unplugged|unknown|error> MESSAGE=<text>[ soc NN][ power N.N][ lock locked|unlocked|unknown][ sync MIN]
+#   lock/sync come from the header of the start page ("Fahrzeug ist verriegelt. Synchronisiert vor 7 Minuten",
+#   sync = age of the car's data in minutes) and are only present if the start page was seen during the run.
 #   charging   the app shows the "stop charging" button
 #   plugged    cable connected, not charging ("start charging" button visible)
 #   unplugged  no cable
@@ -64,6 +66,14 @@ M_DISMISS='Alles klar'                       # "OK" of info dialogs (e.g. after 
 RE_SOC='Batterieladung: [0-9]{1,3} Prozent'                 # battery level in %
 RE_POWER='Ladeleistung: [0-9]+([,.][0-9]+)? Kilowatt'       # charging power in kW
 
+# Header of the start page (content-desc), e.g. "Ihr Fahrzeug: ID.4 Pro Performance. Fahrzeug ist verriegelt.
+# Synchronisiert vor 7 Minuten". Gives lock state and age of the data, e.g. to read more often while driving.
+RE_HEADER='content-desc="Ihr Fahrzeug:[^"]*"'
+M_UNLOCKED='nicht verriegelt|entriegelt'     # checked first
+M_LOCKED='verriegelt'
+RE_SYNC='Synchronisiert vor [0-9]+ ?[A-Za-z]+' # "<n> Sekunden|Minuten|Stunden|Tagen" (or "16 h")
+M_SYNC_NOW='Synchronisiert (gerade|jetzt)'
+
 # Settings page (charge target slider, reduced AC current switch, save)
 SWIPE_TO_SETTINGS='540 1800 540 700'         # swipe up on the start page until the settings entry is visible
 M_SETTINGS='Einstellungen\. Details'         # entry that opens the charging settings
@@ -89,6 +99,8 @@ F=$WORKDIR/vw_ui.xml
 N=$WORKDIR/vw_nodes.txt
 SOC=''
 POWER=''
+LOCK=''
+SYNC=''
 
 # `uiautomator dump` sets accessibility_enabled to 0, which silently disables every accessibility service
 # (e.g. an automation app that confirms the "allow wireless debugging" popup after a reboot).
@@ -102,6 +114,28 @@ dump() {
   a11y
   [ -s "$F" ] || return 1
   grep -o '<node [^>]*>' "$F" > "$N"
+  read_header
+}
+# Lock state and data age from the start page header, if it is on screen (sets LOCK, SYNC in minutes).
+# Uses its own variable names: dump is called inside loops that use k, s, b.
+read_header() {
+  _hd=$(grep -o -E "$RE_HEADER" "$N" | head -1)
+  [ -z "$_hd" ] && return 0
+  if echo "$_hd" | grep -q -E "$M_UNLOCKED"; then LOCK=unlocked
+  elif echo "$_hd" | grep -q -E "$M_LOCKED"; then LOCK=locked
+  else LOCK=unknown; fi
+  _hs=$(echo "$_hd" | grep -o -E "$RE_SYNC" | head -1 | sed -E 's/([0-9])([A-Za-z])/\1 \2/')
+  if [ -n "$_hs" ]; then
+    set -- $_hs
+    case "$4" in
+      Sek*|s) SYNC=0 ;;
+      Min*|min) SYNC=$3 ;;
+      Std*|Stunde*|h) SYNC=$(( $3 * 60 )) ;;
+      Tag*|d) SYNC=$(( $3 * 1440 )) ;;
+    esac
+  elif echo "$_hd" | grep -q -E "$M_SYNC_NOW"; then SYNC=0
+  fi
+  return 0
 }
 nodes() { grep -i -E "(text|content-desc)=\"[^\"]*($1)[^\"]*\"" "$N"; }
 has() { [ -n "$1" ] && nodes "$1" | grep -q .; }
@@ -232,7 +266,7 @@ set_current() {  # $1 on = reduced, off = maximum
   go_home; echo "STATUS=unknown MESSAGE=reduced current $mode saved"; exit 0
 }
 
-finish() { go_home; echo "STATUS=$1 MESSAGE=${2:-ok}${SOC:+ soc $SOC}${POWER:+ power $POWER}"; exit 0; }
+finish() { go_home; echo "STATUS=$1 MESSAGE=${2:-ok}${SOC:+ soc $SOC}${POWER:+ power $POWER}${LOCK:+ lock $LOCK}${SYNC:+ sync $SYNC}"; exit 0; }
 
 case "$1" in
   status|start|stop|current_max|current_reduced|target|target_trip|target_normal)

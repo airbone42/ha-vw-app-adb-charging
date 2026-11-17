@@ -11,7 +11,8 @@ Built for an ID-family car charging from a household socket (granny charger, ~2.
 ## What it does
 
 - `phone/vw.sh` runs on the phone. It opens the VW app, reads the screen with `uiautomator dump`, finds buttons by their text, taps them with `input tap` and reports one line:
-  `STATUS=charging|plugged|unplugged|unknown|error MESSAGE=… soc 48 power 2.3`
+  `STATUS=charging|plugged|unplugged|unknown|error MESSAGE=… soc 48 power 2.3 lock locked sync 7`
+  (`lock` and `sync` come from the header of the app's start page, "Fahrzeug ist verriegelt. Synchronisiert vor 7 Minuten": lock state and age of the car's data in minutes. Useful to read the battery level more often while the car is in use, e.g. for a route planner.)
   Commands: `status`, `start`, `stop`, `current_max`, `current_reduced`, `target <50..100>`, `texts`, `home`, `bg <command>`.
 - `homeassistant/packages/ev_app_charging.yaml`: example Home Assistant package with helpers, the script `script.ev_app` (calls `vw.sh` through the *Android Debug Bridge* integration) and a simple controller:
   - **trip**: select 80 % or 100 % → charge now with maximum current. Targets above 80 % are written to the app before every start.
