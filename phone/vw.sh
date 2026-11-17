@@ -71,8 +71,7 @@ RE_POWER='Ladeleistung: [0-9]+([,.][0-9]+)? Kilowatt'       # charging power in 
 RE_HEADER='content-desc="Ihr Fahrzeug:[^"]*"'
 M_UNLOCKED='nicht verriegelt|entriegelt'     # checked first
 M_LOCKED='verriegelt'
-RE_SYNC='Synchronisiert vor [0-9]+ ?[A-Za-z]+' # "<n> Sekunden|Minuten|Stunden|Tagen" (or "16 h")
-M_SYNC_NOW='Synchronisiert (gerade|jetzt)'
+RE_SYNC='Synchroni[^."]*'                    # "Synchronisiert vor 7 Minuten" (parsed in read_header)
 
 # Settings page (charge target slider, reduced AC current switch, save)
 SWIPE_TO_SETTINGS='540 1800 540 700'         # swipe up on the start page until the settings entry is visible
@@ -124,17 +123,17 @@ read_header() {
   if echo "$_hd" | grep -q -E "$M_UNLOCKED"; then LOCK=unlocked
   elif echo "$_hd" | grep -q -E "$M_LOCKED"; then LOCK=locked
   else LOCK=unknown; fi
-  _hs=$(echo "$_hd" | grep -o -E "$RE_SYNC" | head -1 | sed -E 's/([0-9])([A-Za-z])/\1 \2/')
-  if [ -n "$_hs" ]; then
-    set -- $_hs
-    case "$4" in
-      Sek*|s) SYNC=0 ;;
-      Min*|min) SYNC=$3 ;;
-      Std*|Stunde*|h) SYNC=$(( $3 * 60 )) ;;
-      Tag*|d) SYNC=$(( $3 * 1440 )) ;;
-    esac
-  elif echo "$_hd" | grep -q -E "$M_SYNC_NOW"; then SYNC=0
-  fi
+  # "vor 7 Minuten", "vor 1 Minute", "vor 2 Stunden", "vor 16 h", "vor weniger als einer Minute", "gerade eben"
+  _hs=$(echo "$_hd" | grep -o -E "$RE_SYNC" | head -1)
+  [ -z "$_hs" ] && return 0
+  _hn=$(echo "$_hs" | grep -o -E '[0-9]+' | head -1)
+  [ -z "$_hn" ] && echo "$_hs" | grep -q -E ' (einer|einem|eine) ' && _hn=1
+  case "$_hs" in
+    *weniger*|*gerade*|*jetzt*|*Sekunde*) SYNC=0 ;;
+    *Min*|*' min') [ -n "$_hn" ] && SYNC=$_hn ;;
+    *Stund*|*Std*|*' h') [ -n "$_hn" ] && SYNC=$(( _hn * 60 )) ;;
+    *Tag*|*' d') [ -n "$_hn" ] && SYNC=$(( _hn * 1440 )) ;;
+  esac
   return 0
 }
 nodes() { grep -i -E "(text|content-desc)=\"[^\"]*($1)[^\"]*\"" "$N"; }
